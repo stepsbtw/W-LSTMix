@@ -1,5 +1,29 @@
 import numpy as np
 
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+
+def classification_metrics(y_true, y_pred, y_probs=None):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    results = {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+    }
+
+    if y_probs is not None and len(np.unique(y_true)) > 1:
+        results['auc_roc'] = roc_auc_score(y_true, np.array(y_probs))
+    else:
+        results['auc_roc'] = float('nan')
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        results['tp'] = int(tp)
+        results['fp'] = int(fp)
+        results['tn'] = int(tn)
+        results['fn'] = int(fn)
+
+    return results
 
 def RSE(pred, true):
     return np.sqrt(np.sum((true - pred) ** 2)) / np.sqrt(np.sum((true - true.mean()) ** 2))
