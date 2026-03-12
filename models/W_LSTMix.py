@@ -187,12 +187,12 @@ class Model(nn.Module):
             for _ in range(self.num_blocks_per_stack)
         ])
 
-        # Classification head
+        # Point-level classification head: outputs one logit per time step
         self.classifier = nn.Sequential(
                 nn.Linear(backcast_length * 2, ff_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(p=dropout),
-                nn.Linear(ff_hidden_dim, num_classes)
+                nn.Linear(ff_hidden_dim, backcast_length)
         )
 
         self.to(self.device)
@@ -201,7 +201,7 @@ class Model(nn.Module):
         """
         trend_input: [batch_size, backcast_length]
         seasonality_input: [batch_size, backcast_length]
-        returns: logits [batch_size, num_classes]
+        returns: logits [batch_size, backcast_length] — one logit per point
         """
         # trend_forecast = torch.zeros(trend_input.size(0), self.forecast_length).to(self.device)
         # seasonality_forecast = torch.zeros(seasonality_input.size(0), self.forecast_length).to(self.device)

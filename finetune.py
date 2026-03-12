@@ -115,16 +115,15 @@ class AnomalyDetectionDataset(Dataset):
         # trend_target = self.trend[start + self.backcast_length : start + self.backcast_length + self.forecast_length]
         # season_target = self.season[start + self.backcast_length : start + self.backcast_length + self.forecast_length]
 
-        # Label: 1 if any point in the window is anomalous, else 0
+        # Per-point labels for the window
         window_labels = self.labels[start : start + self.backcast_length]
-        label = 1.0 if np.any(window_labels) else 0.0
 
         return {
             'trend_input': torch.tensor(trend_input, dtype=torch.float32),
             'season_input': torch.tensor(season_input, dtype=torch.float32),
             # 'trend_target': torch.tensor(trend_target, dtype=torch.float32),
             # 'season_target': torch.tensor(season_target, dtype=torch.float32),
-            'label': torch.tensor(label, dtype=torch.float32),
+            'label': torch.tensor(window_labels, dtype=torch.float32),
         }
 
 
@@ -176,7 +175,7 @@ def fixed_time_split(series, labels, train_len=4320, val_len=2160):
 
 
 #def load_datasets(folder_path, backcast_length, forecast_length, method_decom, stride=1, period=24):
-def load_datasets(folder_path, backcast_length, forecast_length, method_decom, stride=1, period=24):
+def load_datasets(folder_path, backcast_length, method_decom, stride=1, period=24):
    
     train_datasets = []
     val_datasets = []
@@ -315,7 +314,7 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
 
                 logits = model(trend_input, season_input)
                 # total_loss = alpha * loss_trend + beta * loss_season
-                loss = criterion(logits.squeeze(-1), label)
+                loss = criterion(logits, label)
 
                 # total_loss.backward()
                 loss.backward()
@@ -361,7 +360,7 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
 
                     # val_loss = alpha * loss_trend + beta * loss_season
                     logits = model(trend_input, season_input)
-                    val_loss = criterion(logits.squeeze(-1), label)
+                    val_loss = criterion(logits, label)
                     val_losses.append(val_loss.item())
 
                     # Collect true and predicted values for RMSE calculation
@@ -369,10 +368,11 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
                     # y_pred_val.extend(trend_pred.cpu().numpy())
                     # y_true_val.extend(season_target.cpu().numpy())
                     # y_pred_val.extend(season_pred.cpu().numpy())
-                    probs = torch.sigmoid(logits.squeeze(-1))
+                    probs = torch.sigmoid(logits)
                     preds = (probs >= threshold).float()
-                    all_labels.extend(label.cpu().numpy())
-                    all_preds.extend(preds.cpu().numpy())
+                    # Flatten to point-level
+                    all_labels.extend(label.cpu().numpy().flatten())
+                    all_preds.extend(preds.cpu().numpy().flatten())
 
         # Calculate average validation loss and RMSE
         avg_val_loss = np.mean(val_losses)
@@ -644,11 +644,10 @@ def test(args, model, criterion, device):
                 energy_data = df['energy'].values
                 # train_data, val_data, test_data = fixed_time_split(energy_data)
 
-                train_data, val_data, test_data = fixed_time_split(energy_data)
                 labels = df['label'].values if 'label' in df.columns else np.zeros(len(energy_data))
                 _, _, _, _, test_data, test_labels = fixed_time_split(energy_data, labels)
             
-                if train_data is None:
+                if test_data is None:
                     continue
                 #dataset = DecomposedTimeSeriesDataset(test_data, backcast_length, forecast_length, method_decom, stride, period)
                 dataset = AnomalyDetectionDataset(test_data, test_labels, backcast_length, method_decom, stride, period)
@@ -687,7 +686,7 @@ def test(args, model, criterion, device):
                         
                     #    loss = alpha * loss_trend + beta * loss_season
                         logits = model(trend_input, season_input)
-                        loss = criterion(logits.squeeze(-1), label)
+                        loss = criterion(logits, label)
                         
                         test_losses.append(loss.item())
                         
@@ -704,11 +703,12 @@ def test(args, model, criterion, device):
                             
                         #     true_combined_unscaled = unscale_predictions(true_combined, dataset.season_mean + dataset.trend_mean, 1.0)
                         #     pred_combined_unscaled = unscale_predictions(pred_combined, dataset.season_mean + dataset.trend_mean, 1.0)
-                        probs = torch.sigmoid(logits.squeeze(-1))
+                        probs = torch.sigmoid(logits)
                         preds = (probs >= threshold).float()
-                        all_labels.extend(label.cpu().numpy())
-                        all_probs.extend(probs.cpu().numpy())
-                        all_preds.extend(preds.cpu().numpy())
+                        # Flatten to point-level
+                        all_labels.extend(label.cpu().numpy().flatten())
+                        all_probs.extend(probs.cpu().numpy().flatten())
+                        all_preds.extend(preds.cpu().numpy().flatten())
                         
         #             backcast_combined = (trend_input + season_input).squeeze().cpu().numpy()
         #             true_forecast_combined = (trend_target + season_target).squeeze().cpu().numpy()

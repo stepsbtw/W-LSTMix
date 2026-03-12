@@ -116,16 +116,15 @@ class AnomalyDetectionDataset(Dataset):
         # trend_target = self.trend[start + self.backcast_length : start + self.backcast_length + self.forecast_length]
         # season_target = self.season[start + self.backcast_length : start + self.backcast_length + self.forecast_length]
 
-        # 1 if any point in the window is anomalous, else 0
+        # Per-point labels for the window
         window_labels = self.labels[start : start + self.backcast_length]
-        label = 1.0 if np.any(window_labels) else 0.0
 
         return {
             'trend_input': torch.tensor(trend_input, dtype=torch.float32),
             'season_input': torch.tensor(season_input, dtype=torch.float32),
             # 'trend_target': torch.tensor(trend_target, dtype=torch.float32),
             # 'season_target': torch.tensor(season_target, dtype=torch.float32),
-            'label': torch.tensor(label, dtype=torch.float32),
+            'label': torch.tensor(window_labels, dtype=torch.float32),
         }
 
 
@@ -233,7 +232,7 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
                 # total_loss = alpha * loss_trend + beta * loss_season
 
                 logits = model(trend_input, season_input)
-                loss = criterion(logits.squeeze(-1), label)
+                loss = criterion(logits, label)
 
                 # total_loss.backward()
                 loss.backward()
@@ -268,11 +267,11 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
                 label = batch['label'].to(device)
 
                 with torch.no_grad():
-                    trend_pred, season_pred = model(trend_input, season_input)
+                    # trend_pred, season_pred = model(trend_input, season_input)
                     # loss_trend = criterion(trend_pred, trend_target)
                     # loss_season = criterion(season_pred, season_target)
                     logits = model(trend_input, season_input)
-                    val_loss = criterion(logits.squeeze(-1), label)
+                    val_loss = criterion(logits, label)
 
                     # val_loss = 0.3 * loss_trend + 0.7 * loss_season
 
@@ -290,10 +289,11 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
                     # y_true_val.extend(season_target.cpu().numpy())
                     # y_pred_val.extend(season_pred.cpu().numpy())
 
-                    probs = torch.sigmoid(logits.squeeze(-1))
+                    probs = torch.sigmoid(logits)
                     preds = (probs >= threshold).float()
-                    all_labels.extend(label.cpu().numpy())
-                    all_preds.extend(preds.cpu().numpy())
+                    # Flatten to point-level: each point gets its own prediction
+                    all_labels.extend(label.cpu().numpy().flatten())
+                    all_preds.extend(preds.cpu().numpy().flatten())
 
         # Calculate average validation loss and RMSE
         avg_val_loss = np.mean(val_losses)
