@@ -120,7 +120,10 @@ W-LSTMix/
 └── requirements.txt
 ```
 
-**Download the test dataset:**
+**Link to the forecasting training dataset:**
+https://huggingface.co/datasets/ai-iot/EnergyBench
+
+**Download the forecasting test dataset:**
    ```bash
    git clone https://huggingface.co/datasets/shivDwd/W_LSTMix_test_dataset
    ```
