@@ -1,7 +1,10 @@
 import os
+import sys
 import argparse
 import numpy as np
 import pandas as pd
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from my_utils.decompose_normalize import decompose_series
 
 
@@ -59,7 +62,7 @@ if __name__ == '__main__':
     p.add_argument('--output', type=str, default=None, help="Output path (default: <input>_labeled)")
     args = p.parse_args()
 
-    output = args.input if args.overwrite else (args.output or args.input.rstrip('/') + '_labeled')
+    output = args.output or args.input.rstrip('/') + '_labeled'
 
     print(f"Input: {args.input}  |  Output: {output}\n")
     label_dataset(args.input, output)
