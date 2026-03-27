@@ -188,13 +188,9 @@ class Model(nn.Module):
         ])
 
         # Point-level classification head: outputs one logit per time step
-        self.classifier = nn.Sequential(
-                nn.Linear(backcast_length * 2, ff_hidden_dim),
-                nn.GELU(),
-                nn.Dropout(p=dropout),
-                nn.Linear(ff_hidden_dim, backcast_length)
-        )
-
+        #self.classifier = nn.Linear(backcast_length * 2, backcast_length) -> THIS ACTUALLY MIXES TIME.
+        self.classifier = nn.Linear(2, 1)
+        
         self.to(self.device)
 
     def forward(self, trend_input, seasonality_input):
@@ -224,8 +220,8 @@ class Model(nn.Module):
             # seasonality_forecast += season_forecast_block
 
         # Concatenate residual representations and classify
-        combined = torch.cat([trend_input, seasonality_input], dim=-1)
-        logits = self.classifier(combined)
+        combined = torch.stack([trend_input, seasonality_input], dim=-1)
+        logits = self.classifier(combined).squeeze(-1)
 
         return logits
 
