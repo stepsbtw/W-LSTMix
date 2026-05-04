@@ -128,6 +128,48 @@ class AnomalyDetectionDataset(Dataset):
         }
 
 
+def to_binary_labels(values):
+    labels = pd.to_numeric(values, errors='coerce').to_numpy()
+    out = np.zeros(len(labels), dtype=np.float32)
+    valid = ~pd.isna(labels)
+    out[valid] = (labels[valid] > 0).astype(np.float32)
+    return out, valid
+
+
+def extract_series_with_labels(df):
+    if 'energy' in df.columns:
+        energy = pd.to_numeric(df['energy'], errors='coerce').to_numpy()
+        if 'label' in df.columns:
+            labels, label_valid = to_binary_labels(df['label'])
+        else:
+            labels = np.zeros(len(energy), dtype=np.float32)
+            label_valid = np.ones(len(energy), dtype=bool)
+
+        valid = (~pd.isna(energy)) & label_valid
+        if valid.any():
+            yield energy[valid].astype(np.float32), labels[valid]
+        return
+
+    for col in df.columns:
+        label_col = f'label_{col}'
+        if col.startswith('label_') or label_col not in df.columns:
+            continue
+
+        series = pd.to_numeric(df[col], errors='coerce').to_numpy()
+        labels, label_valid = to_binary_labels(df[label_col])
+        valid = (~pd.isna(series)) & label_valid
+        if valid.any():
+            yield series[valid].astype(np.float32), labels[valid]
+
+
+def _read_dataframe(file_path):
+    if file_path.endswith('.csv'):
+        return pd.read_csv(file_path)
+    if file_path.endswith('.parquet'):
+        return pd.read_parquet(file_path)
+    return None
+
+
 # In[ ]:
 
 
@@ -135,39 +177,21 @@ class AnomalyDetectionDataset(Dataset):
 def load_datasets(folder_path, backcast_length, method_decom, stride=1, period=24):
     datasets = []
 
-    for region in os.listdir(folder_path):
-        region_path = os.path.join(folder_path, region)
+    for root, _, files in os.walk(folder_path):
+        for filename in files:
+            if not (filename.endswith('.csv') or filename.endswith('.parquet')):
+                continue
 
-        for building in os.listdir(region_path):
+            file_path = os.path.join(root, filename)
+            df = _read_dataframe(file_path)
+            if df is None:
+                continue
 
-            if building.endswith('.csv'):
-                file_path = os.path.join(region_path, building)
-                df = pd.read_csv(file_path)
-                energy_data = df['energy'].values
-                #dataset = DecomposedTimeSeriesDataset(energy_data, backcast_length, forecast_length, method_decom, stride)
-                labels = df['label'].values if 'label' in df.columns else np.zeros(len(energy_data))
-                dataset = AnomalyDetectionDataset(energy_data, labels, backcast_length, method_decom, stride, period)
-                datasets.append(dataset)
-
-
-            elif building.endswith('.parquet'):
-                file_path = os.path.join(region_path, building)
-                df = pd.read_parquet(file_path)
-
-                if 'energy' not in df.columns:
-                    continue  # Skip if energy column is missing
-
-                energy_data = df['energy'].values
-                #dataset = DecomposedTimeSeriesDataset(energy_data, backcast_length, forecast_length, method_decom,  stride, period)
-                labels = df['label'].values if 'label' in df.columns else np.zeros(len(energy_data))
-                dataset = AnomalyDetectionDataset(energy_data, labels, backcast_length, method_decom, stride, period)
-                datasets.append(dataset)
-
-            else:
-                print("Wrong file format!")
+            for series_data, labels in extract_series_with_labels(df):
+                datasets.append(AnomalyDetectionDataset(series_data, labels, backcast_length, method_decom, stride, period))
 
     if len(datasets) == 0:
-        raise RuntimeError("No valid parquet datasets found.")
+        raise RuntimeError("No valid labeled datasets found.")
 
     return ConcatDataset(datasets)
 
@@ -346,9 +370,7 @@ config_file = "./configs/W_LSTMix.json"
 with open(config_file, 'r') as f:
     args = json.load(f)
 
-# train_datasets = load_datasets(args['train_dataset_path'], args['backcast_length'], args['forecast_length'],args['method_decom'], args['stride'])
-# val_datasets = load_datasets(args['val_dataset_path'], args['backcast_length'], args['forecast_length'],args['method_decom'],  args['stride'])
-
+# Load pre-split train and val datasets
 train_datasets = load_datasets(args['train_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
 val_datasets = load_datasets(args['val_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
 
@@ -356,7 +378,6 @@ val_datasets = load_datasets(args['val_dataset_path'], args['backcast_length'], 
 # Create data loaders
 train_loader = DataLoader(train_datasets, batch_size=args['batch_size'], shuffle=True)
 val_loader = DataLoader(val_datasets, batch_size=args['batch_size'], shuffle=True)
-# val_loader = DataLoader(val_datasets, batch_size=args['batch_size'], shuffle=False)  SHUFFLE OR NOT?
 
 
 

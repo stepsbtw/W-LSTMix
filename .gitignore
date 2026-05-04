@@ -1,6 +1,8 @@
 /W_LSTMix_test_dataset/
 /dataset_labeled/
 /dataset/
+/dataset_split/
+/EnergyBench/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -95,6 +95,38 @@ def test(args, model, criterion, device):
     threshold = args.get('threshold', 0.5)
 
 
+    def to_binary_labels(values):
+        labels = pd.to_numeric(values, errors='coerce').to_numpy()
+        out = np.zeros(len(labels), dtype=np.float32)
+        valid = ~pd.isna(labels)
+        out[valid] = (labels[valid] > 0).astype(np.float32)
+        return out, valid
+
+    def extract_series_with_labels(df):
+        if 'energy' in df.columns:
+            energy = pd.to_numeric(df['energy'], errors='coerce').to_numpy()
+            if 'label' in df.columns:
+                labels, label_valid = to_binary_labels(df['label'])
+            else:
+                labels = np.zeros(len(energy), dtype=np.float32)
+                label_valid = np.ones(len(energy), dtype=bool)
+
+            valid = (~pd.isna(energy)) & label_valid
+            if valid.any():
+                yield 'energy', energy[valid].astype(np.float32), labels[valid]
+            return
+
+        for col in df.columns:
+            label_col = f'label_{col}'
+            if col.startswith('label_') or label_col not in df.columns:
+                continue
+
+            series = pd.to_numeric(df[col], errors='coerce').to_numpy()
+            labels, label_valid = to_binary_labels(df[label_col])
+            valid = (~pd.isna(series)) & label_valid
+            if valid.any():
+                yield col, series[valid].astype(np.float32), labels[valid]
+
     # median_res = []  
     all_region_res = []
     for region in os.listdir(folder_path):
@@ -106,72 +138,73 @@ def test(args, model, criterion, device):
 
         res = []
 
-        for building in os.listdir(region_path):
+        for root, _, files in os.walk(region_path):
+            for building in files:
 
             
+                if not (building.endswith('.csv') or building.endswith('.parquet')):
+                    continue
 
-            if building.endswith('.csv') or building.endswith('.parquet'):
-                file_path = os.path.join(region_path, building)
+                file_path = os.path.join(root, building)
                 if building.endswith('.csv'):
-                    building_id = building.rsplit(".csv",1)[0]
+                    base_id = building.rsplit(".csv",1)[0]
                     df = pd.read_csv(file_path)
                 else:
-                    building_id = building.rsplit(".parquet",1)[0]
+                    base_id = building.rsplit(".parquet",1)[0]
                     df = pd.read_parquet(file_path)
-                energy_data = df['energy'].values
 
-                labels = df['label'].values if 'label' in df.columns else np.zeros(len(energy_data))
-                #dataset = DecomposedTimeSeriesDataset(energy_data, backcast_length, forecast_length, method_decom, stride, period)
-                dataset = AnomalyDetectionDataset(energy_data, labels, backcast_length, method_decom, stride, period)
+                for series_name, energy_data, labels in extract_series_with_labels(df):
+                    building_id = f"{base_id}::{series_name}"
+                    dataset = AnomalyDetectionDataset(energy_data, labels, backcast_length, method_decom, stride, period)
 
-                # test phase
-                model.eval()
-                test_losses = []
-                # y_true_trend = []
-                # y_true_seasonal = []
-                # y_pred_trend = []
-                # y_pred_seasonal = []
-                all_labels = []
-                all_probs = []
-                all_preds = []
+                    # test phase
+                    model.eval()
+                    test_losses = []
+                    # y_true_trend = []
+                    # y_true_seasonal = []
+                    # y_pred_trend = []
+                    # y_pred_seasonal = []
+                    all_labels = []
+                    all_probs = []
+                    all_preds = []
 
-                # test loop
-                for batch in tqdm(DataLoader(dataset, batch_size=1, num_workers=4), desc=f"Testing {building_id}", leave=False):
-                #for batch in tqdm(DataLoader(dataset, batch_size=64), desc=f"Testing {building_id}", leave=False):
-                    trend_input = batch['trend_input'].to(device)
-                    season_input = batch['season_input'].to(device)
-                    # trend_target = batch['trend_target'].to(device)
-                    # season_target = batch['season_target'].to(device)
-                    label = batch['label'].to(device)
+                    # test loop
+                    for batch in tqdm(DataLoader(dataset, batch_size=1, num_workers=4), desc=f"Testing {building_id}", leave=False):
+                    #for batch in tqdm(DataLoader(dataset, batch_size=64), desc=f"Testing {building_id}", leave=False):
+                        trend_input = batch['trend_input'].to(device)
+                        season_input = batch['season_input'].to(device)
+                        # trend_target = batch['trend_target'].to(device)
+                        # season_target = batch['season_target'].to(device)
+                        label = batch['label'].to(device)
 
-                    with torch.no_grad():
-                        # trend_pred, season_pred = model(trend_input, season_input)
-                        # loss_trend = criterion(trend_pred, trend_target)
-                        # loss_season = criterion(season_pred, season_target)
+                        with torch.no_grad():
+                            # trend_pred, season_pred = model(trend_input, season_input)
+                            # loss_trend = criterion(trend_pred, trend_target)
+                            # loss_season = criterion(season_pred, season_target)
 
-                        # sum_loss = loss_trend + loss_season
-                        # alpha = loss_season / sum_loss
-                        # beta = loss_trend / sum_loss
+                            # sum_loss = loss_trend + loss_season
+                            # alpha = loss_season / sum_loss
+                            # beta = loss_trend / sum_loss
 
-                        # loss = alpha * loss_trend + beta * loss_season
-                        
-                        logits = model(trend_input, season_input)
-                        loss = criterion(logits, label)
-                        test_losses.append(loss.item())
-                        
-                        # # Collect true and predicted values for RMSE calculation
-                        # y_true_trend.extend(trend_target.cpu().numpy())
-                        # y_true_seasonal.extend(season_target.cpu().numpy())
-                        # y_pred_trend.extend(trend_pred.cpu().numpy())
-                        # y_pred_seasonal.extend(season_pred.cpu().numpy())
+                            # loss = alpha * loss_trend + beta * loss_season
+                            
+                            logits = model(trend_input, season_input)
+                            loss = criterion(logits, label)
+                            test_losses.append(loss.item())
+                            
+                            # # Collect true and predicted values for RMSE calculation
+                            # y_true_trend.extend(trend_target.cpu().numpy())
+                            # y_true_seasonal.extend(season_target.cpu().numpy())
+                            # y_pred_trend.extend(trend_pred.cpu().numpy())
+                            # y_pred_seasonal.extend(season_pred.cpu().numpy())
 
-                        probs = torch.sigmoid(logits)
-                        preds = (probs >= threshold).float()
+                            probs = torch.sigmoid(logits)
+                            preds = (probs >= threshold).float()
 
-                        # Flatten to point-level
-                        all_labels.extend(label.cpu().numpy().flatten())
-                        all_probs.extend(probs.cpu().numpy().flatten())
-                        all_preds.extend(preds.cpu().numpy().flatten())
+                            # Flatten to point-level
+                            all_labels.extend(label.cpu().numpy().flatten())
+                            all_probs.extend(probs.cpu().numpy().flatten())
+                            all_preds.extend(preds.cpu().numpy().flatten())
                         
                 # # Calculate average validation loss and RMSE
                 # y_true_combine_trend = np.concatenate(y_true_trend, axis=0)
@@ -202,25 +235,25 @@ def test(args, model, criterion, device):
 
                 # res.append([building_id, cvrmse, nrmse, mae, mae_norm, mse, mse_norm, avg_test_loss])
 
-                all_labels = np.array(all_labels)
-                all_preds = np.array(all_preds)
-                all_probs = np.array(all_probs)
-                avg_test_loss = np.mean(test_losses)
+                    all_labels = np.array(all_labels)
+                    all_preds = np.array(all_preds)
+                    all_probs = np.array(all_probs)
+                    avg_test_loss = np.mean(test_losses)
 
 
-                acc = accuracy_score(all_labels, all_preds)
-                prec = precision_score(all_labels, all_preds, zero_division=0)
-                rec = recall_score(all_labels, all_preds, zero_division=0)
-                f1 = f1_score(all_labels, all_preds, zero_division=0)
+                    acc = accuracy_score(all_labels, all_preds)
+                    prec = precision_score(all_labels, all_preds, zero_division=0)
+                    rec = recall_score(all_labels, all_preds, zero_division=0)
+                    f1 = f1_score(all_labels, all_preds, zero_division=0)
 
-                if len(np.unique(all_labels)) > 1:
-                    auc = roc_auc_score(all_labels, all_probs)
-                else:
-                    auc = float('nan')
+                    if len(np.unique(all_labels)) > 1:
+                        auc = roc_auc_score(all_labels, all_probs)
+                    else:
+                        auc = float('nan')
 
-                tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
+                    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0, 1]).ravel()
 
-                res.append([building_id, acc, prec, rec, f1, auc, tp, fp, tn, fn, avg_test_loss])
+                    res.append([building_id, acc, prec, rec, f1, auc, tp, fp, tn, fn, avg_test_loss])
 
         # columns = ['building_ID', 'CVRMSE', 'NRMSE', 'MAE', 'MAE_NORM', 'MSE', 'MSE_NORM', 'Avg_Test_Loss']
         # df = pd.DataFrame(res, columns=columns)

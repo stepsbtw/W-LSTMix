@@ -76,7 +76,7 @@ def label_dataset(input_path, output_path, lower=1, upper=99, method='wavelet', 
                     continue
 
                 labels = label_anomalies(
-                    series[valid].to_numpy(),
+                    series[valid].to_numpy().copy(),
                     lower=lower,
                     upper=upper,
                     method=method,
