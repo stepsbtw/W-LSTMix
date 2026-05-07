@@ -102,8 +102,9 @@ class AnomalyDetectionDataset(Dataset):
         self.labels = labels
 
     def __len__(self):
-        # return (len(self.trend) - self.backcast_length - self.forecast_length) // self.stride + 1
-        return (len(self.trend) - self.backcast_length) // self.stride + 1
+        # Ensure non-negative length
+        length = (len(self.trend) - self.backcast_length) // self.stride + 1
+        return max(0, length)
 
     def __getitem__(self, idx):
         start = idx * self.stride
@@ -188,7 +189,11 @@ def load_datasets(folder_path, backcast_length, method_decom, stride=1, period=2
                 continue
 
             for series_data, labels in extract_series_with_labels(df):
-                datasets.append(AnomalyDetectionDataset(series_data, labels, backcast_length, method_decom, stride, period))
+                dataset = AnomalyDetectionDataset(series_data, labels, backcast_length, method_decom, stride, period)
+                if len(dataset) > 0:
+                    datasets.append(dataset)
+                else:
+                    print(f"[Warning] Skipped dataset from {file_path} due to insufficient length.")
 
     if len(datasets) == 0:
         raise RuntimeError("No valid labeled datasets found.")
@@ -276,58 +281,43 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
         # Validation phase
         model.eval()
         val_losses = []
-        # y_true_val = []
-        # y_pred_val = []
-        all_labels = []
-        all_preds = []
+        
+        # Initialize running accumulators
+        tp, fp, fn = 0, 0, 0
+        total_correct, total_samples = 0, 0
 
         # Progress bar for the validation loop
         with tqdm(val_loader, desc=f'Validation Epoch {epoch+1}/{num_epochs}', leave=False) as pbar:
             for batch in pbar:
                 trend_input = batch['trend_input'].to(device)
                 season_input = batch['season_input'].to(device)
-                # trend_target = batch['trend_target'].to(device)
-                # season_target = batch['season_target'].to(device)
                 label = batch['label'].to(device)
 
                 with torch.no_grad():
-                    # trend_pred, season_pred = model(trend_input, season_input)
-                    # loss_trend = criterion(trend_pred, trend_target)
-                    # loss_season = criterion(season_pred, season_target)
                     logits = model(trend_input, season_input)
                     val_loss = criterion(logits, label)
-
-                    # val_loss = 0.3 * loss_trend + 0.7 * loss_season
-
-
-                    # sum_loss = loss_trend + loss_season
-                    # alpha = loss_season / sum_loss
-                    # beta = loss_trend / sum_loss
-
-                    # val_loss = alpha * loss_trend + beta * loss_season
                     val_losses.append(val_loss.item())
-
-                    # # Collect true and predicted values for RMSE calculation
-                    # y_true_val.extend(trend_target.cpu().numpy())
-                    # y_pred_val.extend(trend_pred.cpu().numpy())
-                    # y_true_val.extend(season_target.cpu().numpy())
-                    # y_pred_val.extend(season_pred.cpu().numpy())
 
                     probs = torch.sigmoid(logits)
                     preds = (probs >= threshold).float()
-                    # Flatten to point-level: each point gets its own prediction
-                    all_labels.extend(label.cpu().numpy().flatten())
-                    all_preds.extend(preds.cpu().numpy().flatten())
+                    
+                    # Calculate metrics directly on GPU for this specific batch
+                    total_correct += (preds == label).sum().item()
+                    total_samples += label.numel()
 
-        # Calculate average validation loss and RMSE
+                    tp += ((preds == 1) & (label == 1)).sum().item()
+                    fp += ((preds == 1) & (label == 0)).sum().item()
+                    fn += ((preds == 0) & (label == 1)).sum().item()
+
+        # Calculate average validation loss 
         avg_val_loss = np.mean(val_losses)
         v_loss.append(avg_val_loss)
 
-        # rmse_val = np.sqrt(mean_squared_error(y_true_val, y_pred_val))
-        all_labels = np.array(all_labels)
-        all_preds = np.array(all_preds)
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, zero_division=0)
+        # Calculate final Accuracy and F1 Score from accumulators
+        acc = total_correct / total_samples if total_samples > 0 else 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
         # Print epoch summary
         # print(f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, RMSE: {rmse_val:.4f}')
@@ -363,64 +353,57 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, p
         json.dump(loss_data, f)
 
 
-# In[ ]:
+if __name__ == '__main__':
+    # 1. Load Configs
+    config_file = "./configs/W_LSTMix.json"
+    with open(config_file, 'r') as f:
+        args = json.load(f)
 
+    # 2. Load pre-split train and val datasets
+    train_datasets = load_datasets(args['train_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
+    val_datasets = load_datasets(args['val_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
 
-config_file = "./configs/W_LSTMix.json"
-with open(config_file, 'r') as f:
-    args = json.load(f)
+    # 3. Optimize DataLoader
+    train_loader = DataLoader(
+        train_datasets,
+        batch_size=args['batch_size'],
+        shuffle=True,
+        num_workers=4,        # This caused the error without the __main__ guard
+        pin_memory=True       # Speeds up host to GPU transfer
+    )
+    val_loader = DataLoader(
+        val_datasets,
+        batch_size=args['batch_size'],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
 
-# Load pre-split train and val datasets
-train_datasets = load_datasets(args['train_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
-val_datasets = load_datasets(args['val_dataset_path'], args['backcast_length'], args['method_decom'], args['stride'])
+    # 4. Check device 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # 5. Define Model
+    model = W_LSTMix.Model(
+        device=device,
+        num_blocks_per_stack=args['num_blocks_per_stack'],
+        backcast_length=args['backcast_length'],
+        patch_size=args['patch_size'],
+        num_patches=args['backcast_length'] // args['patch_size'],
+        thetas_dim=args['thetas_dim'],
+        hidden_dim=args['hidden_dim'],
+        embed_dim=args['embed_dim'],
+        num_heads=args['num_heads'],
+        ff_hidden_dim=args['ff_hidden_dim'],
+        num_classes=args.get('num_classes', 1),
+    ).to(device)
 
-# Create data loaders
-train_loader = DataLoader(train_datasets, batch_size=args['batch_size'], shuffle=True)
-val_loader = DataLoader(val_datasets, batch_size=args['batch_size'], shuffle=True)
+    # 6. Model parameters
+    param = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Model's parameter count is:", param)
 
+    # 7. Define loss and optimizer
+    criterion = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args["learning_rate"])
 
-
-# check device 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Define N-BEATS model
-model = W_LSTMix.Model(
-    device=device,
-    num_blocks_per_stack=args['num_blocks_per_stack'],
-    # forecast_length=args['forecast_length'],
-    backcast_length=args['backcast_length'],
-    patch_size=args['patch_size'],
-    num_patches=args['backcast_length'] // args['patch_size'],
-    thetas_dim=args['thetas_dim'],
-    hidden_dim=args['hidden_dim'],
-    embed_dim=args['embed_dim'],
-    num_heads=args['num_heads'],
-    ff_hidden_dim=args['ff_hidden_dim'],
-    num_classes=args.get('num_classes', 1),
-).to(device)
-
-# model's parameters
-param = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print("Model's parameter count is:", param)
-
-# Define loss and optimizer
-# if args['loss'] == 'mse':
-#     criterion = torch.nn.MSELoss()
-# else:
-#     criterion = torch.nn.HuberLoss(reduction="mean", delta=1)
-
-criterion = torch.nn.BCEWithLogitsLoss()
-
-optimizer = torch.optim.Adam(model.parameters(), lr=args["learning_rate"])
-
-# training the model and save best parameters
-train(args, model, criterion, optimizer, device, train_loader, val_loader, param)
-
-
-
-# In[ ]:
-
-
-
-
+    # 8. Train the model
+    train(args, model, criterion, optimizer, device, train_loader, val_loader, param)
