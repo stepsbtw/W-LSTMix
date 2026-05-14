@@ -13,10 +13,12 @@
     "num_classes": 1,
     "threshold": 0.5,
 
-    "train_dataset_path": "./dataset_split/train",
-    "test_dataset_path": "./dataset_split/test",
-    "val_dataset_path": "./dataset_split/val",
-    "real_test_dataset_path": "./W_LSTMix_test_dataset/test",
+    "raw_dataset_path": "/ssd-dataset/source/AnomalyDetection/Hourly_Labeled",
+    "processed_dataset_root": "/mnt/d1ab230f-d72c-497c-8624-81d2005930e5/source/W-LSTMix-Anomaly-Detection/Hourly_Labeled_Split_Processed",
+    "train_dataset_path": "/ssd-dataset/source/AnomalyDetection/Hourly_Labeled_Split/train",
+    "test_dataset_path": "/ssd-dataset/source/AnomalyDetection/Hourly_Labeled_Split/test",
+    "val_dataset_path": "/ssd-dataset/source/AnomalyDetection/Hourly_Labeled_Split/val",
+    "real_test_dataset_path": "/ssd-dataset/source/AnomalyDetection/W_LSTMix_test_dataset/test",
 
     "num_epochs": 100,
 

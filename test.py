@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 sys.path.append('./model')
 
 import torch
@@ -291,9 +292,7 @@ def test(args, model, criterion, device):
 
 
 if __name__ == '__main__':
-
-
-    config_file = "./configs/W_LSTMix.json"
+    config_file = Path(__file__).resolve().parent / "configs" / "W_LSTMix.json"
     with open(config_file, 'r') as f:
         args = json.load(f)
 
