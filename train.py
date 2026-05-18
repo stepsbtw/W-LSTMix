@@ -1,20 +1,19 @@
-
 import os
 import json
 from time import time
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from models import W_LSTMix
 from my_utils.tools import adjust_learning_rate
 from dataset import AnomalyDataset
 
-#performance
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
@@ -36,10 +35,8 @@ def resolve_processed_split_dir(args, split_name):
     if processed_root:
         return os.path.join(processed_root, split_name)
 
-    raise KeyError(
-        f"Missing processed dataset path for split '{split_name}'. "
-        "Set processed_dataset_root or an explicit processed split path in configs/W_LSTMix.json."
-    )
+    raise KeyError(f"Missing processed dataset path for split '{split_name}'. Set processed_dataset_root or an explicit processed split path in configs/W_LSTMix.json.")
+
 
 def evaluate(model, criterion, loader, device, threshold=0.5):
     model.eval()
@@ -56,7 +53,7 @@ def evaluate(model, criterion, loader, device, threshold=0.5):
                 season_input = batch["season_input"].to(device, non_blocking=True)
                 label = batch["label"].to(device, non_blocking=True)
 
-                with autocast():
+                with autocast('cuda'):
                     logits = model(trend_input, season_input)
                     loss = criterion(logits, label)
 
@@ -80,25 +77,124 @@ def evaluate(model, criterion, loader, device, threshold=0.5):
 
     return avg_loss, acc, precision, recall, f1
 
+
+def save_checkpoint(path, epoch, model, optimizer, scaler, best_val_loss, train_loss, val_loss, test_loss, param):
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val_loss": best_val_loss,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "test_loss": test_loss,
+        "param": param,
+    }
+
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(path, model, optimizer=None, scaler=None, device="cpu"):
+    print(f"Loading checkpoint: {path}")
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    if scaler is not None and "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+    start_epoch = checkpoint.get("epoch", -1) + 1
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+
+    train_loss = checkpoint.get("train_loss", [])
+    val_loss = checkpoint.get("val_loss", [])
+    test_loss = checkpoint.get("test_loss", [])
+
+    print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch}")
+
+    return start_epoch, best_val_loss, train_loss, val_loss, test_loss
+
+
+def save_logs(log_path, log_data):
+    """Overwrite the log file with the latest log_data dict."""
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2)
+
+
 def train(args, model, criterion, optimizer, device, train_loader, val_loader, test_loader, param):
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     patience = args["patience"]
     threshold = args.get("threshold", 0.5)
     num_epochs = args["num_epochs"]
 
-    best_val_loss = float("inf")
-    counter = 0
+    os.makedirs(args["model_save_path"], exist_ok=True)
 
-    train_start_time = time()
+    save_dir = args["model_save_path"]
+
+    # Always auto-resume from latest_checkpoint.pth inside model_save_path
+    checkpoint_path = os.path.join(save_dir, "latest_checkpoint.pth")
+
+    start_epoch = 0
+    best_val_loss = float("inf")
     t_loss = []
     v_loss = []
     test_loss_hist = []
 
-    os.makedirs(args["model_save_path"], exist_ok=True)
+    if os.path.isfile(checkpoint_path):
+        start_epoch, best_val_loss, t_loss, v_loss, test_loss_hist = load_checkpoint(
+            checkpoint_path, model, optimizer, scaler, device
+        )
+    else:
+        print("No checkpoint found — starting from scratch.")
 
-    for epoch in range(num_epochs):
+    # ── Restore epoch logs and metadata from existing training_log.json ─────
+    log_path = os.path.join(save_dir, "training_log.json")
+    epoch_logs = []
+    prior_best_epoch = None
+    prior_run_start = datetime.now().isoformat(timespec="seconds")
+
+    if os.path.isfile(log_path):
+        try:
+            with open(log_path, "r") as f:
+                prior = json.load(f)
+            epoch_logs = prior.get("epochs", [])
+            prior_best_epoch = prior.get("best_epoch", None)
+            prior_run_start = prior.get("run_start", prior_run_start)
+            print(f"Restored {len(epoch_logs)} epoch log(s) from {log_path}")
+        except Exception as e:
+            print(f"Warning: could not restore training log ({e}), starting fresh log.")
+
+    # Recompute early-stopping counter from tail of restored logs
+    counter = 0
+    if prior_best_epoch is not None and epoch_logs:
+        for record in reversed(epoch_logs):
+            if record.get("epoch", 0) <= prior_best_epoch:
+                break
+            counter += 1
+
+    log_data = {
+        "run_start": prior_run_start,
+        "param": param,
+        "args": args,
+        "best_val_loss": best_val_loss,
+        "best_epoch": prior_best_epoch,
+        "total_training_time_s": None,
+        "epochs": epoch_logs,
+        "train_loss": t_loss,
+        "val_loss": v_loss,
+        "test_loss": test_loss_hist,
+    }
+
+    train_start_time = time()
+
+    for epoch in range(start_epoch, num_epochs):
         model.train()
+
         train_losses = []
         epoch_start = time()
 
@@ -110,7 +206,7 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with autocast():
+                with autocast('cuda'):
                     logits = model(trend_input, season_input)
                     loss = criterion(logits, label)
 
@@ -124,59 +220,86 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
                     pbar.set_postfix(
                         loss=f"{loss.item():.4f}",
                         gpu_mem=f"{torch.cuda.memory_allocated()/1024**3:.2f}GB",
-                        elapsed=f"{time() - epoch_start:.1f}s"
+                        elapsed=f"{time() - epoch_start:.1f}s",
                     )
 
-        avg_train_loss = float(np.mean(train_losses)) if len(train_losses) > 0 else 0.0
+        epoch_time = time() - epoch_start
+        avg_train_loss = float(np.mean(train_losses)) if train_losses else 0.0
         t_loss.append(avg_train_loss)
 
         val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(model, criterion, val_loader, device, threshold=threshold)
         v_loss.append(val_loss)
 
-        msg = (
-            f"Epoch {epoch+1}/{num_epochs} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
-            f"Acc: {val_acc:.4f} | "
-            f"F1: {val_f1:.4f}"
-        )
-        print(msg)
+        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
+
+        # ── Build epoch record ───────────────────────────────────────────────
+        epoch_record = {
+            "epoch": epoch + 1,
+            "epoch_time_s": round(epoch_time, 2),
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "train": {
+                "loss": round(avg_train_loss, 6),
+            },
+            "val": {
+                "loss": round(val_loss, 6),
+                "accuracy": round(val_acc, 6),
+                "precision": round(val_prec, 6),
+                "recall": round(val_rec, 6),
+                "f1": round(val_f1, 6),
+            },
+            "test": None,
+        }
 
         if test_loader is not None:
-            test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
-                model, criterion, test_loader, device, threshold=threshold
-            )
+            test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(model, criterion, test_loader, device, threshold=threshold)
             test_loss_hist.append(test_loss)
-            print(
-                f"           Test Loss: {test_loss:.4f} | "
-                f"Acc: {test_acc:.4f} | "
-                f"F1: {test_f1:.4f}"
-            )
+            print(f"           Test  Loss: {test_loss:.4f} | Acc: {test_acc:.4f} | F1: {test_f1:.4f}")
 
+            epoch_record["test"] = {
+                "loss": round(test_loss, 6),
+                "accuracy": round(test_acc, 6),
+                "precision": round(test_prec, 6),
+                "recall": round(test_rec, 6),
+                "f1": round(test_f1, 6),
+            }
+
+        epoch_logs.append(epoch_record)
+
+        # ── Checkpoint + early stopping ──────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             counter = 0
-            torch.save(model.state_dict(), f'{args["model_save_path"]}/best_model.pth')
+
+            best_model_path = os.path.join(save_dir, "best_model.pth")
+            save_checkpoint(best_model_path, epoch, model, optimizer, scaler, best_val_loss, t_loss, v_loss, test_loss_hist, param)
+            print(f"Saved best model to: {best_model_path}")
+
+            log_data["best_val_loss"] = round(best_val_loss, 6)
+            log_data["best_epoch"] = epoch + 1
+
         else:
             counter += 1
             if counter >= patience:
                 print("Early stopping triggered.")
+                epoch_logs[-1]["early_stop"] = True
                 break
+
+        save_checkpoint(checkpoint_path, epoch, model, optimizer, scaler, best_val_loss, t_loss, v_loss, test_loss_hist, param)
 
         adjust_learning_rate(optimizer, epoch + 1, args)
 
+        # ── Persist logs after every epoch ──────────────────────────────────
+        log_data["total_training_time_s"] = round(time() - train_start_time, 2)
+        save_logs(log_path, log_data)
+
     total_time = time() - train_start_time
+    log_data["total_training_time_s"] = round(total_time, 2)
+    log_data["run_end"] = datetime.now().isoformat(timespec="seconds")
+    save_logs(log_path, log_data)
+
     print(f"Total Training Time: {total_time:.2f}s")
+    print(f"Training log saved to: {log_path}")
 
-    loss_data = {
-        "param": param,
-        "train_loss": t_loss,
-        "val_loss": v_loss,
-        "test_loss": test_loss_hist
-    }
-
-    with open(f'{args["model_save_path"]}/loss_data.json', 'w') as f:
-        json.dump(loss_data, f, indent=2)
 
 if __name__ == "__main__":
     config_file = Path(__file__).resolve().parent / "configs" / "W_LSTMix.json"
@@ -185,6 +308,7 @@ if __name__ == "__main__":
         args = json.load(f)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     print("Using device:", device)
 
     train_dir = resolve_processed_split_dir(args, "train")
@@ -193,45 +317,18 @@ if __name__ == "__main__":
 
     train_dataset = AnomalyDataset(train_dir)
     val_dataset = AnomalyDataset(val_dir)
+
     test_dataset = AnomalyDataset(test_dir) if os.path.isdir(test_dir) else None
 
     num_workers = args.get("num_workers", 16)
     persistent_workers = num_workers > 0
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.get("batch_size", 256),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=persistent_workers,
-        prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None,
-        drop_last=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.get("batch_size", 256),
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=persistent_workers,
-        prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None,
-        drop_last=False
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.get("batch_size", 256), shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers, prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.get("batch_size", 256), shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers, prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None, drop_last=False)
 
     test_loader = None
     if test_dataset is not None:
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=args.get("batch_size", 256),
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
-            prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None,
-            drop_last=False
-        )
+        test_loader = DataLoader(test_dataset, batch_size=args.get("batch_size", 256), shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers, prefetch_factor=args.get("prefetch_factor", 4) if num_workers > 0 else None, drop_last=False)
 
     model = W_LSTMix.Model(
         device=device,
@@ -249,23 +346,16 @@ if __name__ == "__main__":
     ).to(device)
 
     param = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     print("Trainable params:", param)
 
     loss_name = args.get("loss", "bce").lower()
+
     if loss_name in {"bce", "bcewithlogits", "bcewithlogitsloss"}:
         criterion = torch.nn.BCEWithLogitsLoss()
     else:
         raise ValueError(f"Unsupported loss '{args.get('loss')}'. Expected 'bce' for this training script.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args["learning_rate"])
 
-    train(
-        args,
-        model,
-        criterion,
-        optimizer,
-        device,
-        train_loader,
-        val_loader,
-        test_loader,
-        param
-    )
+    train(args, model, criterion, optimizer, device, train_loader, val_loader, test_loader, param)
