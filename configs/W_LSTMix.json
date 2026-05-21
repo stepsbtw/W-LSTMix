@@ -1,7 +1,7 @@
 {
     "backcast_length": 168,
     "stride": 24,
-    "batch_size": 1024,
+    "batch_size": 128,
     "embed_dim": 8,
     "num_heads": 2,
     "ff_hidden_dim": 256,
@@ -30,7 +30,7 @@
     "result_path_finetune": "/home/hidra/source/W-LSTMix-Anomaly-Detection/results/paco_shot/W_LSTMix_finetune",
 
     "loss": "bce",
-    "learning_rate": 0.001,
+    "learning_rate": 0.0001,
     "lradj": "type1",
     "method_decom" : "wavelet" 
 }

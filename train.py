@@ -11,7 +11,7 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from models import W_LSTMix
-from my_utils.tools import adjust_learning_rate
+# my_utils.tools import adjust_learning_rate 
 from dataset import AnomalyDataset
 
 torch.backends.cudnn.benchmark = True
@@ -36,6 +36,33 @@ def resolve_processed_split_dir(args, split_name):
         return os.path.join(processed_root, split_name)
 
     raise KeyError(f"Missing processed dataset path for split '{split_name}'. Set processed_dataset_root or an explicit processed split path in configs/W_LSTMix.json.")
+
+
+def compute_automated_pos_weight(dataset, dataloader):
+    print("Calculating automated class weights from training dataset...")
+    
+    if hasattr(dataset, 'labels') and dataset.labels is not None:
+        labels = torch.tensor(dataset.labels)
+    elif hasattr(dataset, 'targets') and dataset.targets is not None:
+        labels = torch.tensor(dataset.targets)
+    else:
+        print("Dataset properties not exposed. Performing a fast dataloader label sweep...")
+        label_list = []
+        for batch in tqdm(dataloader, desc="Label Sweep", leave=False):
+            label_list.append(batch["label"].view(-1))
+        labels = torch.cat(label_list)
+        
+    num_normals = (labels == 0).sum().item()
+    num_anomalies = (labels == 1).sum().item()
+    
+    if num_anomalies == 0:
+        print("Warning: No anomalies found in training set. Setting pos_weight to 1.0")
+        return torch.tensor([1.0])
+        
+    pos_weight_val = num_normals / num_anomalies
+    print(f"--> Found {num_normals} normal samples and {num_anomalies} anomalies.")
+    print(f"--> Automated pos_weight value: {pos_weight_val:.4f}")
+    return torch.tensor([pos_weight_val])
 
 
 def evaluate(model, criterion, loader, device, threshold=0.5):
@@ -78,19 +105,19 @@ def evaluate(model, criterion, loader, device, threshold=0.5):
     return avg_loss, acc, precision, recall, f1
 
 
-def save_checkpoint(path, epoch, model, optimizer, scaler, best_val_loss, train_loss, val_loss, test_loss, param):
+def save_checkpoint(path, epoch, model, optimizer, scaler, best_val_loss, counter, train_loss, val_loss, test_loss, param):
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_val_loss": best_val_loss,
+        "early_stop_counter": counter,
         "train_loss": train_loss,
         "val_loss": val_loss,
         "test_loss": test_loss,
         "param": param,
     }
-
     torch.save(checkpoint, path)
 
 
@@ -109,6 +136,7 @@ def load_checkpoint(path, model, optimizer=None, scaler=None, device="cpu"):
 
     start_epoch = checkpoint.get("epoch", -1) + 1
     best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    counter = checkpoint.get("early_stop_counter", 0)
 
     train_loss = checkpoint.get("train_loss", [])
     val_loss = checkpoint.get("val_loss", [])
@@ -116,7 +144,7 @@ def load_checkpoint(path, model, optimizer=None, scaler=None, device="cpu"):
 
     print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch}")
 
-    return start_epoch, best_val_loss, train_loss, val_loss, test_loss
+    return start_epoch, best_val_loss, counter, train_loss, val_loss, test_loss
 
 
 def save_logs(log_path, log_data):
@@ -133,26 +161,31 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
     num_epochs = args["num_epochs"]
 
     os.makedirs(args["model_save_path"], exist_ok=True)
-
     save_dir = args["model_save_path"]
 
-    # Always auto-resume from latest_checkpoint.pth inside model_save_path
     checkpoint_path = os.path.join(save_dir, "latest_checkpoint.pth")
 
     start_epoch = 0
     best_val_loss = float("inf")
+    counter = 0
     t_loss = []
     v_loss = []
     test_loss_hist = []
 
     if os.path.isfile(checkpoint_path):
-        start_epoch, best_val_loss, t_loss, v_loss, test_loss_hist = load_checkpoint(
+        start_epoch, best_val_loss, counter, t_loss, v_loss, test_loss_hist = load_checkpoint(
             checkpoint_path, model, optimizer, scaler, device
         )
     else:
         print("No checkpoint found — starting from scratch.")
 
-    # ── Restore epoch logs and metadata from existing training_log.json ─────
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=3
+    )
+
     log_path = os.path.join(save_dir, "training_log.json")
     epoch_logs = []
     prior_best_epoch = None
@@ -165,17 +198,11 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
             epoch_logs = prior.get("epochs", [])
             prior_best_epoch = prior.get("best_epoch", None)
             prior_run_start = prior.get("run_start", prior_run_start)
-            print(f"Restored {len(epoch_logs)} epoch log(s) from {log_path}")
+            
+            epoch_logs = [e for e in epoch_logs if e["epoch"] <= start_epoch]
+            print(f"Restored {len(epoch_logs)} sanitized epoch log(s) from {log_path}")
         except Exception as e:
             print(f"Warning: could not restore training log ({e}), starting fresh log.")
-
-    # Recompute early-stopping counter from tail of restored logs
-    counter = 0
-    if prior_best_epoch is not None and epoch_logs:
-        for record in reversed(epoch_logs):
-            if record.get("epoch", 0) <= prior_best_epoch:
-                break
-            counter += 1
 
     log_data = {
         "run_start": prior_run_start,
@@ -232,7 +259,6 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
 
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
 
-        # ── Build epoch record ───────────────────────────────────────────────
         epoch_record = {
             "epoch": epoch + 1,
             "epoch_time_s": round(epoch_time, 2),
@@ -265,13 +291,12 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
 
         epoch_logs.append(epoch_record)
 
-        # ── Checkpoint + early stopping ──────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             counter = 0
 
             best_model_path = os.path.join(save_dir, "best_model.pth")
-            save_checkpoint(best_model_path, epoch, model, optimizer, scaler, best_val_loss, t_loss, v_loss, test_loss_hist, param)
+            save_checkpoint(best_model_path, epoch, model, optimizer, scaler, best_val_loss, counter, t_loss, v_loss, test_loss_hist, param)
             print(f"Saved best model to: {best_model_path}")
 
             log_data["best_val_loss"] = round(best_val_loss, 6)
@@ -282,13 +307,13 @@ def train(args, model, criterion, optimizer, device, train_loader, val_loader, t
             if counter >= patience:
                 print("Early stopping triggered.")
                 epoch_logs[-1]["early_stop"] = True
+                save_checkpoint(checkpoint_path, epoch, model, optimizer, scaler, best_val_loss, counter, t_loss, v_loss, test_loss_hist, param)
                 break
 
-        save_checkpoint(checkpoint_path, epoch, model, optimizer, scaler, best_val_loss, t_loss, v_loss, test_loss_hist, param)
+        save_checkpoint(checkpoint_path, epoch, model, optimizer, scaler, best_val_loss, counter, t_loss, v_loss, test_loss_hist, param)
 
-        adjust_learning_rate(optimizer, epoch + 1, args)
+        scheduler.step(val_loss)
 
-        # ── Persist logs after every epoch ──────────────────────────────────
         log_data["total_training_time_s"] = round(time() - train_start_time, 2)
         save_logs(log_path, log_data)
 
@@ -317,7 +342,6 @@ if __name__ == "__main__":
 
     train_dataset = AnomalyDataset(train_dir)
     val_dataset = AnomalyDataset(val_dir)
-
     test_dataset = AnomalyDataset(test_dir) if os.path.isdir(test_dir) else None
 
     num_workers = args.get("num_workers", 16)
@@ -346,16 +370,16 @@ if __name__ == "__main__":
     ).to(device)
 
     param = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
     print("Trainable params:", param)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args["learning_rate"])
 
     loss_name = args.get("loss", "bce").lower()
 
     if loss_name in {"bce", "bcewithlogits", "bcewithlogitsloss"}:
-        criterion = torch.nn.BCEWithLogitsLoss()
+        pos_weight = compute_automated_pos_weight(train_dataset, train_loader).to(device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     else:
         raise ValueError(f"Unsupported loss '{args.get('loss')}'. Expected 'bce' for this training script.")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args["learning_rate"])
 
     train(args, model, criterion, optimizer, device, train_loader, val_loader, test_loader, param)
